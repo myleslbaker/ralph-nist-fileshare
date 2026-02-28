@@ -10,8 +10,6 @@ GREEN='\033[32m'; YELLOW='\033[33m'; CYAN='\033[36m'; RED='\033[31m'; BLUE='\033
 UP='\033[A'; CLEAR_TO_EOL='\033[K'; CLEAR_BELOW='\033[J'
 IS_TTY=false; [ -t 1 ] && IS_TTY=true
 
-WINDOW_LINES=12   # lines of rolling claude output to show
-
 # ── Argument parsing ─────────────────────────────────────────────────────────
 TOOL="amp"
 MAX_ITERATIONS=10
@@ -66,100 +64,6 @@ print(f"{passing}|{total}|{nid}|{ntitle}")
 PY
 }
 
-# Parse stream-json log into human-readable lines for the rolling window.
-# Emits tool calls + non-partial assistant text, one line each.
-extract_display_lines() {
-  local logfile="$1" n="${2:-$WINDOW_LINES}"
-  python3 - "$logfile" "$n" <<'PY'
-import json, sys, re
-logfile, n = sys.argv[1], int(sys.argv[2])
-out = []
-try:
-    with open(logfile) as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                obj = json.loads(raw)
-            except json.JSONDecodeError:
-                # Plain-text fallback (shouldn't happen with stream-json)
-                clean = re.sub(r'\x1b\[[0-9;]*m', '', raw).strip()
-                if clean:
-                    out.append(clean)
-                continue
-            t = obj.get('type', '')
-            if t == 'assistant':
-                partial = obj.get('partial', False)
-                for block in obj.get('message', {}).get('content', []):
-                    bt = block.get('type', '')
-                    if bt == 'tool_use':
-                        name = block.get('name', '?')
-                        inp  = block.get('input', {})
-                        # Best single-line summary of the tool call
-                        detail = (inp.get('command')
-                                  or inp.get('file_path')
-                                  or inp.get('prompt', '')[:60]
-                                  or str(inp)[:60])
-                        out.append(f'[{name}] {detail}')
-                    elif bt == 'text':
-                        # Show text regardless of partial flag — stream-json marks
-                        # all in-progress chunks as partial:true, so filtering on
-                        # that hides everything until the very end.
-                        for line in block.get('text', '').split('\n'):
-                            line = line.strip()
-                            if line:
-                                out.append(line)
-            elif t == 'system':
-                pass   # skip init noise
-except Exception:
-    pass
-for line in out[-n:]:
-    print(line[:100])
-PY
-}
-
-# Print the rolling-window header + last N parsed lines from stream-json log.
-DRAWN=0
-draw_window() {
-  local logfile="$1" elapsed="$2" passing="$3" total="$4" next_title="$5"
-
-  # Erase previous window (TTY only)
-  if $IS_TTY && (( DRAWN > 0 )); then
-    printf "\033[%dA\033[J" "$DRAWN"
-  fi
-
-  # Collect parsed display lines
-  local raw_lines=()
-  while IFS= read -r line; do
-    raw_lines+=("$line")
-  done < <(extract_display_lines "$logfile" "$WINDOW_LINES")
-
-  local bar
-  bar=$(printf '─%.0s' {1..64})
-
-  printf "${BOLD}${CYAN}  ┌${bar}┐${RESET}\n"
-  printf "${BOLD}${CYAN}  │${RESET} %-64s${BOLD}${CYAN}│${RESET}\n" \
-    "$(printf "⏱  %s   📦 %s/%s passing   ▶ %s" "$elapsed" "$passing" "$total" "$next_title" | cut -c1-64)"
-  printf "${BOLD}${CYAN}  ├${bar}┤${RESET}\n"
-
-  local count=3
-  if (( ${#raw_lines[@]} == 0 )); then
-    printf "${CYAN}  │${RESET}${DIM} %-64s${RESET}${CYAN}│${RESET}\n" "(starting...)"
-    ((count++))
-  else
-    for line in "${raw_lines[@]}"; do
-      local clean
-      clean=$(printf '%s' "$line" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-64)
-      printf "${CYAN}  │${RESET}${DIM} %-64s${RESET}${CYAN}│${RESET}\n" "$clean"
-      ((count++))
-    done
-  fi
-
-  printf "${BOLD}${CYAN}  └${bar}┘${RESET}\n"
-  ((count++))
-  DRAWN=$count
-}
 
 # Print iteration banner (not erased, stays in scroll-back)
 print_banner() {
@@ -246,52 +150,45 @@ for i in $(seq 1 $MAX_ITERATIONS); do
     cat "$SCRIPT_DIR/prompt.md" | amp --dangerously-allow-all >"$TMPLOG" 2>&1 || EXIT_CODE=$?
     OUTPUT=$(cat "$TMPLOG")
   else
-    # Launch claude in background with stream-json so output arrives line-by-line
+    # Launch claude in background (plain --print mode — stream-json conflicts with --print)
     env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
-      claude --dangerously-skip-permissions --no-session-persistence \
-      --output-format stream-json --include-partial-messages \
+      claude --dangerously-skip-permissions \
       --print "Read and follow ALL instructions in all .md files in the $PROJECT_DIR directory. This is iteration $i of $MAX_ITERATIONS." \
       >"$TMPLOG" 2>&1 &
     CLAUDE_PID=$!
 
-    # Live rolling window while claude runs
+    # Spinner while claude runs
     if $IS_TTY; then
+      SPINNER=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+      SP=0
+      SPINNER_LINES=0
       while kill -0 "$CLAUDE_PID" 2>/dev/null; do
         ELAPSED=$(fmt_elapsed $(( $(date +%s) - ITER_START )))
-        # Re-read prd.json on each refresh so counts stay current
         IFS='|' read -r cur_passing cur_total _nid cur_next_title < <(prd_stats)
-        draw_window "$TMPLOG" "$ELAPSED" "$cur_passing" "$cur_total" "$cur_next_title"
+        # Erase previous spinner line
+        if (( SPINNER_LINES > 0 )); then
+          printf "\033[%dA\033[J" "$SPINNER_LINES"
+        fi
+        local bar
+        bar=$(printf '─%.0s' {1..64})
+        printf "${BOLD}${CYAN}  ┌${bar}┐${RESET}\n"
+        printf "${BOLD}${CYAN}  │${RESET} %-64s${BOLD}${CYAN}│${RESET}\n" \
+          "$(printf "⏱  %s   📦 %s/%s passing   ▶ %s" "$ELAPSED" "$cur_passing" "$cur_total" "$cur_next_title" | cut -c1-64)"
+        printf "${BOLD}${CYAN}  │${RESET}${DIM} %s  Claude working...%-45s${RESET}${BOLD}${CYAN}│${RESET}\n" \
+          "${SPINNER[$SP]}" ""
+        printf "${BOLD}${CYAN}  └${bar}┘${RESET}\n"
+        SPINNER_LINES=4
+        SP=$(( (SP + 1) % ${#SPINNER[@]} ))
         sleep 0.4
       done
-      # One final refresh then erase the window so the summary prints cleanly
-      ELAPSED=$(fmt_elapsed $(( $(date +%s) - ITER_START )))
-      draw_window "$TMPLOG" "$ELAPSED" "$before_passing" "$total" "$next_title"
-      sleep 0.2
-      $IS_TTY && (( DRAWN > 0 )) && printf "\033[%dA\033[J" "$DRAWN"
-      DRAWN=0
+      # Erase spinner
+      if (( SPINNER_LINES > 0 )); then
+        printf "\033[%dA\033[J" "$SPINNER_LINES"
+      fi
     fi
 
     wait "$CLAUDE_PID" || EXIT_CODE=$?
-    # Extract final result text from stream-json (the {"type":"result"} line)
-    OUTPUT=$(python3 - "$TMPLOG" <<'PY'
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        for raw in f:
-            try:
-                obj = json.loads(raw.strip())
-                if obj.get('type') == 'result':
-                    print(obj.get('result', ''))
-            except Exception:
-                pass
-except Exception:
-    pass
-PY
-)
-    # Fallback: grep raw file if result extraction produced nothing
-    if [ -z "$OUTPUT" ]; then
-      OUTPUT=$(cat "$TMPLOG")
-    fi
+    OUTPUT=$(cat "$TMPLOG")
   fi
 
   rm -f "$TMPLOG"
