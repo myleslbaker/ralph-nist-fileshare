@@ -169,7 +169,6 @@ for i in $(seq 1 $MAX_ITERATIONS); do
         if (( SPINNER_LINES > 0 )); then
           printf "\033[%dA\033[J" "$SPINNER_LINES"
         fi
-        local bar
         bar=$(printf '─%.0s' {1..64})
         printf "${BOLD}${CYAN}  ┌${bar}┐${RESET}\n"
         printf "${BOLD}${CYAN}  │${RESET} %-64s${BOLD}${CYAN}│${RESET}\n" \
