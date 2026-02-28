@@ -1,0 +1,25 @@
+## Codebase Patterns
+- infracost is NOT configured (no API key) — use `terraform apply -auto-approve` directly
+- Always check for existing AWS resources before creating (import if already exists)
+- NAT Gateways are FORBIDDEN by IAM policy
+- Always push to GitHub after EVERY commit
+- terraform apply must succeed before marking passes: true
+- occ commands MUST run as www-data: `sudo -u www-data php /var/www/nextcloud/occ`
+- Nextcloud LDAP: use radius-bind service account (password from SSM /nist/samba/radius-bind-password)
+- WebDAV testing: use curl with -k flag (self-signed cert), basic auth, PROPFIND for listing
+- SSM Run Command: use base64-encode for scripts with special chars or complex quoting
+- MariaDB: use utf8mb4 character set for Nextcloud database
+- Nextcloud trusted_domains must include the server's private IP or requests will be rejected
+- PHP memory_limit must be >= 512M for Nextcloud
+- SSE (server-side encryption): run `occ encryption:enable` then `occ encryption:encrypt-all --yes`
+- EC2 in private subnet needs: SSM VPC Interface Endpoints (ssm, ssmmessages, ec2messages) to register with SSM
+- SSM endpoints already exist from parent project in this VPC — check before creating new ones
+- Ubuntu 22.04 has amazon-ssm-agent via snap, registers ~90s after VPC endpoints available
+- IAM policy versions max 5: delete oldest non-default version before creating new
+- Secrets Manager: use recovery_window_in_days=0 for replay scripts (avoids 30-day deletion lock)
+- git push may report "remote rejected" if daemon already pushed — check remote state first
+---
+
+# Ralph Progress Log — NIST Secure File Share
+Started: 2026-02-28
+---

@@ -1,0 +1,867 @@
+{
+  "projectName": "NIST 800-171 Secure File Share (Dropbox-style)",
+  "description": "Deploys a NIST 800-171 compliant secure file share using Nextcloud 27+, integrated with the existing NIST.LAB Active Directory and VPN infrastructure. Provides Dropbox-like functionality: desktop sync clients (Windows/Linux via nextcloudcmd), mobile-compatible HTTPS access, end-to-end encrypted folders, password-protected external sharing, file versioning with restore, per-user quotas, and group workspaces. All access is restricted to VPN-authenticated users with full CloudWatch audit logging.",
+  "branchName": "main",
+  "integrationContext": {
+    "parentProject": "ralph-nist-iac-v5",
+    "notes": "Builds on existing NIST.LAB AD (Samba 4), OpenVPN+TOTP MFA, and VPC infrastructure. Do NOT recreate VPC, subnets, IGW, or IAM base policies. Discover all parent resources dynamically via SSM parameters or AWS tags.",
+    "ssmParameters": {
+      "dc1PrivateIp": "/nist/infra/dc1-private-ip",
+      "vpnPrivateIp": "/nist/infra/vpn-private-ip",
+      "radiusBindPassword": "/nist/samba/radius-bind-password"
+    },
+    "vpc": "vpc-0029e7ab9f2917e2c",
+    "privateSubnet": "subnet-0cff2938b18b3977a",
+    "adDomain": "NIST.LAB",
+    "adDomainLower": "nist.lab",
+    "vpnClientSubnet": "10.8.0.0/24",
+    "vpcCidr": "10.0.0.0/16",
+    "kmsKeyAlias": "alias/nist-iac-builder",
+    "tfStateKey": "projects/nist-fileshare/terraform.tfstate"
+  },
+  "technologyStack": {
+    "server": "Nextcloud 27+ on Ubuntu 22.04 EC2 (t3.small, 60GB EBS)",
+    "database": "MariaDB 10.x — local on same instance",
+    "webserver": "Nginx + PHP 8.1-fpm",
+    "authentication": "Nextcloud LDAP plugin → Samba AD (nist.lab)",
+    "encryption": "Nextcloud server-side encryption (default module) + Nextcloud End-to-End Encryption (E2EE) app for sensitive folders",
+    "sync": "nextcloudcmd CLI client (headless, scriptable) for automated verification; Nextcloud desktop app for end users",
+    "tls": "Self-signed cert (internal CA shared with email project) for HTTPS"
+  },
+  "stories": [
+    {
+      "id": 1,
+      "priority": 1,
+      "title": "[A] Create security group nist-sg-fileshare",
+      "description": "Create EC2 security group 'nist-sg-fileshare' in vpc-0029e7ab9f2917e2c. Inbound: TCP 443 from VPN subnet 10.8.0.0/24 (Nextcloud HTTPS), TCP 443 from VPC CIDR 10.0.0.0/16 (internal access). Outbound: all. NO 0.0.0.0/0 inbound. Tag Project=nist-fileshare.",
+      "passes": false,
+      "test_requirements": [
+        "Security group nist-sg-fileshare exists in correct VPC",
+        "Inbound TCP 443 from 10.8.0.0/24 present",
+        "Inbound TCP 443 from 10.0.0.0/16 present",
+        "No inbound rule allows 0.0.0.0/0",
+        "No public IP assigned (private subnet)"
+      ]
+    },
+    {
+      "id": 2,
+      "priority": 2,
+      "title": "[A] Create IAM role ec2-fileshare-role with instance profile",
+      "description": "Create IAM role 'ec2-fileshare-role' with EC2 trust policy. Attach: AmazonSSMManagedInstanceCore, CloudWatchAgentServerPolicy. Inline policy: ssm:GetParameter on /nist/* and /nist-fileshare/*, s3:GetObject/PutObject on nist-fileshare-backup-{account_id}/*, kms:Decrypt+GenerateDataKey on alias/nist-iac-builder, secretsmanager:GetSecretValue on nist-* secrets. Create instance profile 'ec2-fileshare-profile'. Tag Project=nist-fileshare.",
+      "passes": false,
+      "test_requirements": [
+        "IAM role ec2-fileshare-role exists",
+        "Instance profile ec2-fileshare-profile exists and linked to role",
+        "AmazonSSMManagedInstanceCore attached",
+        "CloudWatchAgentServerPolicy attached",
+        "Inline policy allows ssm:GetParameter on /nist/* paths"
+      ]
+    },
+    {
+      "id": 3,
+      "priority": 3,
+      "title": "[A] Create S3 bucket for fileshare backups",
+      "description": "Create S3 bucket 'nist-fileshare-backup-{aws_account_id}': SSE-KMS with alias/nist-iac-builder, versioning enabled, all public access blocked, lifecycle rule expire after 30 days. Tag Project=nist-fileshare.",
+      "passes": false,
+      "test_requirements": [
+        "Bucket nist-fileshare-backup-{account_id} exists",
+        "SSE-KMS encryption with nist-iac-builder key",
+        "Versioning is Enabled",
+        "All 4 public access block settings are true"
+      ]
+    },
+    {
+      "id": 4,
+      "priority": 4,
+      "title": "[A] Store fileshare SSM placeholder and verify IAM access",
+      "description": "Via SSM: write SSM parameter /nist-fileshare/status with value 'phase-a-complete' to confirm the IAM role can write/read SSM under /nist-fileshare/* prefix.",
+      "passes": false,
+      "test_requirements": [
+        "SSM parameter /nist-fileshare/status exists with value 'phase-a-complete'",
+        "ec2-fileshare-role can read /nist-fileshare/* SSM parameters"
+      ]
+    },
+    {
+      "id": 5,
+      "priority": 5,
+      "title": "[A-END-1] Write Phase A test and replay scripts",
+      "description": "Write scripts/test-phase-a.sh verifying: nist-sg-fileshare SG exists with correct rules, ec2-fileshare-role and instance profile exist with correct policies, S3 backup bucket exists with SSE-KMS. Write scripts/replay-to-phase-a.sh for idempotent terraform destroy+apply of Phase A resources.",
+      "passes": false,
+      "test_requirements": [
+        "test-phase-a.sh exits 0 with all checks PASS",
+        "replay-to-phase-a.sh completes successfully"
+      ]
+    },
+    {
+      "id": 6,
+      "priority": 6,
+      "title": "[A-END-2] EXECUTE PROOF: Destroy and replay to Phase A",
+      "description": "Run replay-to-phase-a.sh. Run test-phase-a.sh. All PASS. Record DEPLOYMENT-PROOF in progress.txt with real SG ID and role ARN.",
+      "passes": false,
+      "test_requirements": [
+        "replay-to-phase-a.sh exits 0",
+        "test-phase-a.sh returns all PASS",
+        "DEPLOYMENT-PROOF in progress.txt with real resource IDs"
+      ]
+    },
+    {
+      "id": 7,
+      "priority": 7,
+      "title": "[A-END-3] Git tag phase-a-complete and push",
+      "description": "Commit all Phase A files. Push. Tag phase-a-complete.",
+      "passes": false,
+      "test_requirements": [
+        "git tag phase-a-complete pushed to GitHub"
+      ]
+    },
+    {
+      "id": 8,
+      "priority": 8,
+      "title": "[B] Launch fileshare1 EC2 in private subnet",
+      "description": "Launch EC2 'nist-fileshare1': Ubuntu 22.04 LTS (latest Canonical AMI), t3.small, 60GB EBS gp3 (/opt/nextcloud-data volume needs space), IAM profile ec2-fileshare-profile, SG nist-sg-fileshare, private subnet subnet-0cff2938b18b3977a, NO public IP. user_data: apt-get update && snap install amazon-ssm-agent --classic && snap start amazon-ssm-agent. Tag Name=nist-fileshare1.",
+      "passes": false,
+      "test_requirements": [
+        "EC2 nist-fileshare1 in running state",
+        "Private IP in 10.0.64.0/20",
+        "No public IP assigned",
+        "SSM PingStatus Online within 120s of launch"
+      ]
+    },
+    {
+      "id": 9,
+      "priority": 9,
+      "title": "[B] Set hostname, configure DNS resolver to use DC1",
+      "description": "Via SSM on fileshare1: set hostname fileshare1.nist.lab (hostnamectl). Configure /etc/resolv.conf to use DC1 IP (from SSM /nist/infra/dc1-private-ip) as nameserver with search domain nist.lab. Verify nslookup dc1.nist.lab resolves. Add DNS A record fileshare1.nist.lab → fileshare1 private IP via samba-tool on DC1.",
+      "passes": false,
+      "test_requirements": [
+        "hostname returns fileshare1.nist.lab",
+        "nslookup dc1.nist.lab from fileshare1 resolves to DC1 IP",
+        "nslookup fileshare1.nist.lab from fileshare1 resolves to fileshare1 private IP",
+        "DNS A record fileshare1.nist.lab exists in Samba AD"
+      ]
+    },
+    {
+      "id": 10,
+      "priority": 10,
+      "title": "[B] Install MariaDB, PHP 8.1, Nginx on fileshare1",
+      "description": "Via SSM on fileshare1: apt-get install -y mariadb-server nginx php8.1-fpm php8.1-mysql php8.1-curl php8.1-xml php8.1-mbstring php8.1-gd php8.1-zip php8.1-intl php8.1-ldap php8.1-bcmath php8.1-gmp php8.1-imagick. Set PHP memory_limit=512M, upload_max_filesize=10G, post_max_size=10G, max_execution_time=3600 in /etc/php/8.1/fpm/php.ini. Enable and start services.",
+      "passes": false,
+      "test_requirements": [
+        "mariadb service active",
+        "php8.1-fpm service active",
+        "nginx service active",
+        "php -m | grep -E 'ldap|gd|zip|intl|mbstring' shows all 5 modules",
+        "php -i | grep memory_limit shows 512M"
+      ]
+    },
+    {
+      "id": 11,
+      "priority": 11,
+      "title": "[B] Create MariaDB database and user for Nextcloud",
+      "description": "Via SSM on fileshare1: create database 'nextcloud', user 'ncuser'@'localhost' with randomly generated password stored in SSM /nist-fileshare/db/password. GRANT ALL ON nextcloud.* TO 'ncuser'@'localhost'. Run mysql -e 'SELECT 1' as ncuser to verify. Set innodb_large_prefix=ON, innodb_file_format=Barracuda in /etc/mysql/mariadb.conf.d/50-server.cnf and restart.",
+      "passes": false,
+      "test_requirements": [
+        "Database 'nextcloud' exists",
+        "User 'ncuser'@'localhost' exists",
+        "mysql -u ncuser -p{pass} nextcloud -e 'SELECT 1' returns success",
+        "SSM parameter /nist-fileshare/db/password exists"
+      ]
+    },
+    {
+      "id": 12,
+      "priority": 12,
+      "title": "[B] Verify fileshare1 can reach Samba AD LDAP and DC1",
+      "description": "Via SSM on fileshare1: verify TCP 389 reachable from fileshare1 to DC1 IP. Verify TCP 636 (LDAPS) reachable. Run ldapsearch -x -H ldap://{dc1_ip} -b DC=nist,DC=lab -D CN=radius-bind,OU=NIST-Users,DC=nist,DC=lab -w {radius_bind_pw} '(sAMAccountName=vpn-user)' and confirm user record returned.",
+      "passes": false,
+      "test_requirements": [
+        "TCP connection to DC1:389 succeeds from fileshare1",
+        "ldapsearch returns vpn-user record from Samba AD",
+        "LDAP query result contains sAMAccountName=vpn-user"
+      ]
+    },
+    {
+      "id": 13,
+      "priority": 13,
+      "title": "[B-END-1] Write Phase B test and replay scripts",
+      "description": "Write scripts/test-phase-b.sh: verify fileshare1 running, SSM online, hostname, DNS resolution of dc1.nist.lab, MariaDB running, PHP modules, LDAP connectivity to DC1. Write scripts/replay-to-phase-b.sh idempotent replay of A+B (skip apt if already installed).",
+      "passes": false,
+      "test_requirements": [
+        "test-phase-b.sh exits 0 with all checks PASS",
+        "replay-to-phase-b.sh completes successfully"
+      ]
+    },
+    {
+      "id": 14,
+      "priority": 14,
+      "title": "[B-END-2] EXECUTE PROOF: Destroy and replay to Phase B",
+      "description": "Run replay-to-phase-b.sh. Run test-phase-b.sh. All PASS. DEPLOYMENT-PROOF in progress.txt with fileshare1 instance ID.",
+      "passes": false,
+      "test_requirements": [
+        "replay-to-phase-b.sh exits 0",
+        "test-phase-b.sh all PASS",
+        "DEPLOYMENT-PROOF with fileshare1 instance ID"
+      ]
+    },
+    {
+      "id": 15,
+      "priority": 15,
+      "title": "[B-END-3] Git tag phase-b-complete and push",
+      "description": "Commit all Phase B files. Push. Tag phase-b-complete.",
+      "passes": false,
+      "test_requirements": [
+        "git tag phase-b-complete pushed to GitHub"
+      ]
+    },
+    {
+      "id": 16,
+      "priority": 16,
+      "title": "[C] Generate TLS certificate for fileshare1.nist.lab",
+      "description": "Via SSM on fileshare1: generate self-signed CA (RSA 4096, 10yr) and server cert for fileshare1.nist.lab (RSA 2048, 3yr, SAN: fileshare1.nist.lab, files.nist.lab). Store CA cert in SSM /nist-fileshare/tls/ca-cert (plaintext), server key in /nist-fileshare/tls/server-key (SecureString). Copy to /etc/ssl/nist-fileshare/ on the instance.",
+      "passes": false,
+      "test_requirements": [
+        "/etc/ssl/nist-fileshare/ca.crt exists on fileshare1",
+        "/etc/ssl/nist-fileshare/server.crt exists on fileshare1",
+        "/etc/ssl/nist-fileshare/server.key exists with mode 640",
+        "openssl x509 -noout -subject on server.crt shows CN=fileshare1.nist.lab",
+        "SSM parameters /nist-fileshare/tls/ca-cert and /nist-fileshare/tls/server-key exist"
+      ]
+    },
+    {
+      "id": 17,
+      "priority": 17,
+      "title": "[C] Install Nextcloud 27+ on fileshare1",
+      "description": "Via SSM on fileshare1: download Nextcloud 27.1.11 tarball (or latest stable) from https://download.nextcloud.com/server/releases/, verify SHA256 checksum, extract to /var/www/nextcloud. Create data directory /opt/nextcloud-data owned by www-data. Configure Nginx HTTPS virtual host: listen 443 ssl, ssl cert/key from /etc/ssl/nist-fileshare/, root /var/www/nextcloud, PHP-FPM upstream. Redirect HTTP 80 → 443.",
+      "passes": false,
+      "test_requirements": [
+        "/var/www/nextcloud/index.php exists",
+        "/opt/nextcloud-data exists owned by www-data",
+        "Nginx listening on port 443",
+        "curl -k https://127.0.0.1/ returns HTTP 200 or 302 (Nextcloud setup wizard or login)"
+      ]
+    },
+    {
+      "id": 18,
+      "priority": 18,
+      "title": "[C] Complete Nextcloud initial setup via occ CLI",
+      "description": "Via SSM on fileshare1: run Nextcloud installer: sudo -u www-data php /var/www/nextcloud/occ maintenance:install --database=mysql --database-name=nextcloud --database-user=ncuser --database-pass={from_ssm} --admin-user=nc-admin --admin-pass={16-char-random} --data-dir=/opt/nextcloud-data. Store admin password in SSM /nist-fileshare/nextcloud/admin-password. Set trusted_domains to include fileshare1 private IP and fileshare1.nist.lab.",
+      "passes": false,
+      "test_requirements": [
+        "occ status returns 'Nextcloud is installed: true'",
+        "occ status returns 'Maintenance mode: false'",
+        "curl -k https://127.0.0.1/ returns HTTP 200 (no setup wizard — goes to login page)",
+        "SSM parameter /nist-fileshare/nextcloud/admin-password exists"
+      ]
+    },
+    {
+      "id": 19,
+      "priority": 19,
+      "title": "[C] Configure Nextcloud performance: opcache, cron, memcached",
+      "description": "Via SSM on fileshare1: install php8.1-apcu for memory caching. Set in config.php: memcache.local=\\OC\\Memcache\\APCu. Set up background jobs via system cron: www-data crontab entry '*/5 * * * * php /var/www/nextcloud/cron.php'. Configure opcache settings in /etc/php/8.1/fpm/conf.d/: opcache.enable=1, opcache.memory_consumption=128, opcache.max_accelerated_files=10000. Restart php8.1-fpm.",
+      "passes": false,
+      "test_requirements": [
+        "occ config:system:get memcache.local returns OC\\Memcache\\APCu",
+        "www-data crontab contains cron.php entry",
+        "php8.1-fpm service running after config change",
+        "occ background:cron returns background jobs mode set to cron"
+      ]
+    },
+    {
+      "id": 20,
+      "priority": 20,
+      "title": "[C-END-1] Write Phase C test and replay scripts",
+      "description": "Write scripts/test-phase-c.sh: verify TLS cert exists and valid, Nextcloud installed (occ status), HTTPS on port 443, login page returns 200, APCu caching configured, cron job present. Write scripts/replay-to-phase-c.sh for idempotent replay A+B+C.",
+      "passes": false,
+      "test_requirements": [
+        "test-phase-c.sh exits 0 with all checks PASS",
+        "replay-to-phase-c.sh completes successfully"
+      ]
+    },
+    {
+      "id": 21,
+      "priority": 21,
+      "title": "[C-END-2] EXECUTE PROOF: Destroy and replay to Phase C",
+      "description": "Run replay-to-phase-c.sh. Run test-phase-c.sh. All PASS. DEPLOYMENT-PROOF in progress.txt.",
+      "passes": false,
+      "test_requirements": [
+        "replay-to-phase-c.sh exits 0",
+        "test-phase-c.sh all PASS",
+        "DEPLOYMENT-PROOF in progress.txt"
+      ]
+    },
+    {
+      "id": 22,
+      "priority": 22,
+      "title": "[C-END-3] Git tag phase-c-complete and push",
+      "description": "Commit all Phase C files. Push. Tag phase-c-complete.",
+      "passes": false,
+      "test_requirements": [
+        "git tag phase-c-complete pushed to GitHub"
+      ]
+    },
+    {
+      "id": 23,
+      "priority": 23,
+      "title": "[D] Configure Nextcloud LDAP integration with Samba AD",
+      "description": "Via SSM on fileshare1: enable user_ldap app (occ app:enable user_ldap). Configure via occ ldap:create-empty-config then occ ldap:set-config: ldapHost={dc1_ip}, ldapPort=389, ldapBase=DC=nist,DC=lab, ldapAgentName=CN=radius-bind,OU=NIST-Users,DC=nist,DC=lab, ldapAgentPassword from SSM, ldapUserFilter=(&(objectClass=person)(sAMAccountName=*)), ldapLoginFilter=(&(objectClass=person)(sAMAccountName=%uid)), ldapGroupFilter=(&(objectClass=group)), ldapGroupMemberAssocAttr=member, ldapUserDisplayName=displayName.",
+      "passes": false,
+      "test_requirements": [
+        "occ ldap:test-config returns configuration valid and connection works",
+        "occ user:list shows vpn-user and nist-admin from LDAP",
+        "occ group:list shows NIST groups from Samba AD"
+      ]
+    },
+    {
+      "id": 24,
+      "priority": 24,
+      "title": "[D] Verify AD user login to Nextcloud via web (curl test)",
+      "description": "Via SSM on fileshare1: use curl to POST credentials to /index.php/login with requesttoken. Test vpn-user with correct password VpnUser1234!NIST → expect redirect to /apps/dashboard (HTTP 302). Test vpn-user with WRONG password → expect HTTP 200 (back to login with error). Test nist-admin login similarly.",
+      "passes": false,
+      "test_requirements": [
+        "Login with vpn-user/VpnUser1234!NIST returns HTTP 302 redirect to dashboard",
+        "Login with vpn-user/WRONGPASSWORD returns HTTP 200 (login page with error)",
+        "Login with nist-admin/NistAdmin1234!NIST returns HTTP 302 redirect"
+      ]
+    },
+    {
+      "id": 25,
+      "priority": 25,
+      "title": "[D] Configure Nextcloud user quotas and password policy",
+      "description": "Via SSM on fileshare1: enable password_policy and files_external apps (if needed). Set default user quota: occ config:app:set files default_quota --value='10 GB'. Install and enable the 'password_policy' app: occ app:enable password_policy. Configure: min length 14 chars (matching NIST 800-171 3.5.7). Configure account lockout: occ config:system:set auth.bruteforce.protection.enabled --value=true --type=boolean. Set max login attempts before lockout to 5.",
+      "passes": false,
+      "test_requirements": [
+        "occ config:app:get files default_quota returns '10 GB'",
+        "password_policy app enabled",
+        "occ config:app:get password_policy minLength returns 14",
+        "Brute-force protection enabled in config.php"
+      ]
+    },
+    {
+      "id": 26,
+      "priority": 26,
+      "title": "[D] Create Nextcloud group structure and shared workspace",
+      "description": "Via SSM on fileshare1 as nc-admin: create Nextcloud group 'NIST-Staff' and add vpn-user and nist-admin via OCS API. Create group folder 'NIST-Shared' using the groupfolders app (occ app:enable groupfolders; occ groupfolders:create 'NIST-Shared'; occ groupfolders:group {folder_id} NIST-Staff write). Verify both vpn-user and nist-admin can see NIST-Shared in their file list.",
+      "passes": false,
+      "test_requirements": [
+        "Nextcloud group NIST-Staff exists with vpn-user and nist-admin as members",
+        "NIST-Shared group folder exists and is assigned to NIST-Staff group",
+        "WebDAV PROPFIND as vpn-user returns NIST-Shared in directory listing",
+        "WebDAV PROPFIND as nist-admin returns NIST-Shared in directory listing"
+      ]
+    },
+    {
+      "id": 27,
+      "priority": 27,
+      "title": "[D-END-1] Write Phase D test and replay scripts",
+      "description": "Write scripts/test-phase-d.sh: verify LDAP config valid, vpn-user and nist-admin visible in occ user:list, login test returns 302 for correct credentials and 200 for wrong, NIST-Staff group exists, NIST-Shared folder exists. Write scripts/replay-to-phase-d.sh for idempotent replay A+B+C+D.",
+      "passes": false,
+      "test_requirements": [
+        "test-phase-d.sh exits 0 with all checks PASS",
+        "replay-to-phase-d.sh completes successfully"
+      ]
+    },
+    {
+      "id": 28,
+      "priority": 28,
+      "title": "[D-END-2] EXECUTE PROOF: Destroy and replay to Phase D",
+      "description": "Run replay-to-phase-d.sh. Run test-phase-d.sh. All PASS. DEPLOYMENT-PROOF in progress.txt.",
+      "passes": false,
+      "test_requirements": [
+        "replay-to-phase-d.sh exits 0",
+        "test-phase-d.sh all PASS",
+        "DEPLOYMENT-PROOF in progress.txt"
+      ]
+    },
+    {
+      "id": 29,
+      "priority": 29,
+      "title": "[D-END-3] Git tag phase-d-complete and push",
+      "description": "Commit all Phase D files. Push. Tag phase-d-complete.",
+      "passes": false,
+      "test_requirements": [
+        "git tag phase-d-complete pushed to GitHub"
+      ]
+    },
+    {
+      "id": 30,
+      "priority": 30,
+      "title": "[E] Verify WebDAV file upload and download (Dropbox-style sync protocol)",
+      "description": "Via SSM on fileshare1: use curl WebDAV to test Dropbox-like sync operations as vpn-user. (1) PUT a test file 'sync-test.txt' with content 'NIST-FILESHARE-TEST-CONTENT' to vpn-user's WebDAV root. (2) PROPFIND to verify file listed. (3) GET the file and verify content matches. (4) DELETE the file. (5) PROPFIND again to verify file is gone. All ops via HTTPS with self-signed CA trust.",
+      "passes": false,
+      "test_requirements": [
+        "WebDAV PUT returns 201 Created",
+        "WebDAV PROPFIND lists sync-test.txt",
+        "WebDAV GET returns exact content 'NIST-FILESHARE-TEST-CONTENT'",
+        "WebDAV DELETE returns 204 No Content",
+        "WebDAV PROPFIND after DELETE does not list sync-test.txt"
+      ]
+    },
+    {
+      "id": 31,
+      "priority": 31,
+      "title": "[E] Verify file versioning — upload, modify, restore previous version",
+      "description": "Via SSM on fileshare1: use WebDAV to upload 'versioned-doc.txt' with content 'VERSION_1'. Upload same filename with content 'VERSION_2' (triggers versioning). Upload again with 'VERSION_3'. Use Nextcloud OCS API to list versions (GET /remote.php/dav/versions/{userid}/versions/{file_id}). Restore to VERSION_1 using COPY method on version URL. Download and verify content is 'VERSION_1'.",
+      "passes": false,
+      "test_requirements": [
+        "3 versions of versioned-doc.txt created (OCS API lists 2+ previous versions)",
+        "Version restore COPY request returns 201 Created",
+        "WebDAV GET after restore returns content 'VERSION_1'",
+        "Current file content is 'VERSION_1' (not VERSION_2 or VERSION_3)"
+      ]
+    },
+    {
+      "id": 32,
+      "priority": 32,
+      "title": "[E] Verify password-protected external share link",
+      "description": "Via SSM on fileshare1: use Nextcloud OCS Share API (POST /ocs/v2.php/apps/files_sharing/api/v1/shares) authenticated as vpn-user to create a public share link for a test file with: shareType=3 (public link), password='SharePass123!', expireDate=+7days. Retrieve the share URL. Download the file via the share URL with password. Verify download succeeds. Verify download WITHOUT password returns 401/redirect-to-login.",
+      "passes": false,
+      "test_requirements": [
+        "Share link created with OCS API (returns share token)",
+        "GET share URL with correct password returns file content",
+        "GET share URL with wrong password returns HTTP 401 or redirect to password form",
+        "Share link has expireDate set 7 days in future"
+      ]
+    },
+    {
+      "id": 33,
+      "priority": 33,
+      "title": "[E] Verify group collaboration — shared folder read/write",
+      "description": "Via SSM on fileshare1: as vpn-user, PUT a file 'collab-test.txt' into the NIST-Shared group folder via WebDAV. As nist-admin, PROPFIND NIST-Shared to verify file is visible. As nist-admin, GET collab-test.txt to verify content. As nist-admin, PUT a reply file 'collab-reply.txt' into NIST-Shared. As vpn-user, verify the reply file is visible and readable. Tests bidirectional collaboration.",
+      "passes": false,
+      "test_requirements": [
+        "vpn-user PUT to NIST-Shared returns 201 Created",
+        "nist-admin PROPFIND shows collab-test.txt in NIST-Shared",
+        "nist-admin GET returns correct content of collab-test.txt",
+        "nist-admin PUT of collab-reply.txt returns 201 Created",
+        "vpn-user PROPFIND shows collab-reply.txt in NIST-Shared"
+      ]
+    },
+    {
+      "id": 34,
+      "priority": 34,
+      "title": "[E] Verify large file upload (chunked upload >100MB)",
+      "description": "Via SSM on fileshare1: generate a 150MB test file (dd if=/dev/urandom bs=1M count=150 | base64 > /tmp/large-test.b64 — or similar). Upload via Nextcloud chunked upload protocol (PUT to /remote.php/dav/uploads/{user}/{upload_id}/{chunk_index}; then MOVE to assemble). Verify assembled file exists and size is correct. Delete the file after verification.",
+      "passes": false,
+      "test_requirements": [
+        "150MB test file generated on fileshare1",
+        "Chunked upload completes (MOVE request returns 201)",
+        "PROPFIND shows assembled file with correct size (within 5% of 150MB)",
+        "File deleted after test (cleanup)"
+      ]
+    },
+    {
+      "id": 35,
+      "priority": 35,
+      "title": "[E] Verify desktop sync client (nextcloudcmd headless)",
+      "description": "Via SSM on fileshare1: install nextcloud-desktop-client or nextcloudcmd (apt-get install -y nextcloud-desktop-cmd or build from source). Run nextcloudcmd -u vpn-user -p VpnUser1234!NIST --trust-all-ssl --non-interactive /tmp/nc-sync-test https://127.0.0.1/. Create a file in /tmp/nc-sync-test/ locally, run nextcloudcmd again to sync up. Verify file appears on server via WebDAV PROPFIND.",
+      "passes": false,
+      "test_requirements": [
+        "nextcloudcmd binary available (which nextcloudcmd or find)",
+        "Initial sync completes without error",
+        "File created locally syncs to server (appears in WebDAV PROPFIND after second sync run)",
+        "nextcloudcmd exit code 0"
+      ]
+    },
+    {
+      "id": 36,
+      "priority": 36,
+      "title": "[E-END-1] Write Phase E test and replay scripts",
+      "description": "Write scripts/test-phase-e.sh: run all 5 WebDAV tests (upload/download/delete), verify versioning (upload 2 versions, list versions API), verify share link with password, verify group collaboration, verify large file chunked upload. Write scripts/replay-to-phase-e.sh for idempotent replay A through E.",
+      "passes": false,
+      "test_requirements": [
+        "test-phase-e.sh exits 0 with all checks PASS",
+        "replay-to-phase-e.sh completes successfully"
+      ]
+    },
+    {
+      "id": 37,
+      "priority": 37,
+      "title": "[E-END-2] EXECUTE PROOF: Destroy and replay to Phase E",
+      "description": "Run replay-to-phase-e.sh. Run test-phase-e.sh. All PASS. DEPLOYMENT-PROOF in progress.txt.",
+      "passes": false,
+      "test_requirements": [
+        "replay-to-phase-e.sh exits 0",
+        "test-phase-e.sh all PASS",
+        "DEPLOYMENT-PROOF in progress.txt"
+      ]
+    },
+    {
+      "id": 38,
+      "priority": 38,
+      "title": "[E-END-3] Git tag phase-e-complete and push",
+      "description": "Commit all Phase E files. Push. Tag phase-e-complete.",
+      "passes": false,
+      "test_requirements": [
+        "git tag phase-e-complete pushed to GitHub"
+      ]
+    },
+    {
+      "id": 39,
+      "priority": 39,
+      "title": "[F] Enable Nextcloud server-side encryption",
+      "description": "Via SSM on fileshare1: enable encryption app (occ app:enable encryption). Enable default module (occ encryption:enable). Turn on encryption for all files: put maintenance mode on, run occ encryption:encrypt-all --yes (or equivalent), restore maintenance mode off. Verify occ encryption:status returns enabled:true.",
+      "passes": false,
+      "test_requirements": [
+        "occ encryption:status returns 'enabled: true'",
+        "occ encryption:list-modules shows OC_DEFAULT_MODULE enabled",
+        "Upload a test file and verify raw disk file is NOT readable plaintext (grep for known content returns nothing)"
+      ]
+    },
+    {
+      "id": 40,
+      "priority": 40,
+      "title": "[F] Verify SSE — encrypted files unreadable on disk",
+      "description": "Via SSM on fileshare1: upload a file containing the string 'DISK_ENCRYPTION_VERIFY_STRING_12345' as vpn-user via WebDAV. Find the file in /opt/nextcloud-data/. Run grep -r 'DISK_ENCRYPTION_VERIFY_STRING_12345' /opt/nextcloud-data/ — MUST return no matches. Then download the file via WebDAV and verify the content IS readable (decryption works). This confirms encryption at rest (NIST 800-171 3.13.16).",
+      "passes": false,
+      "test_requirements": [
+        "grep -r 'DISK_ENCRYPTION_VERIFY_STRING_12345' /opt/nextcloud-data/ returns NO matches",
+        "WebDAV GET of the same file returns correct plaintext content",
+        "Encryption confirmed: data opaque on disk, accessible via application"
+      ]
+    },
+    {
+      "id": 41,
+      "priority": 41,
+      "title": "[F] Enable and configure Nextcloud End-to-End Encryption app",
+      "description": "Via SSM on fileshare1: install and enable Nextcloud E2EE app (occ app:enable end_to_end_encryption). E2EE requires Nextcloud desktop client to set up client-side keys — verify the app is enabled and the API endpoint /ocs/v2.php/apps/end_to_end_encryption/api/v1/public-key is accessible. Document that E2EE folder creation requires desktop client (cannot be done headlessly). Write to SSM /nist-fileshare/e2ee/status = 'enabled-requires-client'. Verify occ app:list shows end_to_end_encryption as enabled.",
+      "passes": false,
+      "test_requirements": [
+        "occ app:list shows end_to_end_encryption as enabled",
+        "GET /ocs/v2.php/apps/end_to_end_encryption/api/v1/public-key returns HTTP 200",
+        "SSM parameter /nist-fileshare/e2ee/status exists",
+        "E2EE-CLIENT-SETUP-GUIDE.md committed to repo explaining desktop client setup"
+      ]
+    },
+    {
+      "id": 42,
+      "priority": 42,
+      "title": "[F] Configure session timeout and security hardening in Nextcloud",
+      "description": "Via SSM on fileshare1: set in config.php: session_lifetime=900 (15 min, NIST AC-11), session_keepalive=false, token_auth_enforced=true (app passwords required for WebDAV/sync), remember_login_cookie_lifetime=0 (no persistent cookies). Configure Nginx: add security headers (Strict-Transport-Security, X-Frame-Options: SAMEORIGIN, X-Content-Type-Options: nosniff, Referrer-Policy). Restart services.",
+      "passes": false,
+      "test_requirements": [
+        "occ config:system:get session_lifetime returns 900",
+        "occ config:system:get token_auth_enforced returns true",
+        "curl -k -I https://127.0.0.1/ response headers include Strict-Transport-Security",
+        "curl -k -I https://127.0.0.1/ response headers include X-Frame-Options: SAMEORIGIN"
+      ]
+    },
+    {
+      "id": 43,
+      "priority": 43,
+      "title": "[F] Restrict Nextcloud access to VPN and VPC CIDRs via Nginx",
+      "description": "Via SSM on fileshare1: add to Nginx server block: allow 10.8.0.0/24; allow 10.0.0.0/16; deny all. Also set in Nextcloud config.php: trusted_proxies, overwriteprotocol=https. The instance has no public IP and is in a private subnet, so this is defense-in-depth. Verify: request from localhost (10.0.x.x range) returns 200, external access blocked by SG. Document security boundaries.",
+      "passes": false,
+      "test_requirements": [
+        "Nginx config contains 'deny all' after allow directives",
+        "curl from 127.0.0.1 returns HTTP 200 (VPC-local allowed)",
+        "Instance has no public IP (verified via EC2 metadata or terraform output)",
+        "Security group nist-sg-fileshare has no 0.0.0.0/0 inbound (verified via AWS CLI)"
+      ]
+    },
+    {
+      "id": 44,
+      "priority": 44,
+      "title": "[F-END-1] Write Phase F test and replay scripts",
+      "description": "Write scripts/test-phase-f.sh: verify SSE enabled, disk encryption test (grep fails for known string), E2EE app enabled, session_lifetime=900, token_auth_enforced=true, security headers present, nginx deny-all present. Write scripts/replay-to-phase-f.sh for idempotent replay A through F.",
+      "passes": false,
+      "test_requirements": [
+        "test-phase-f.sh exits 0 with all checks PASS",
+        "replay-to-phase-f.sh completes successfully"
+      ]
+    },
+    {
+      "id": 45,
+      "priority": 45,
+      "title": "[F-END-2] EXECUTE PROOF: Destroy and replay to Phase F",
+      "description": "Run replay-to-phase-f.sh. Run test-phase-f.sh. All PASS. DEPLOYMENT-PROOF in progress.txt.",
+      "passes": false,
+      "test_requirements": [
+        "replay-to-phase-f.sh exits 0",
+        "test-phase-f.sh all PASS",
+        "DEPLOYMENT-PROOF in progress.txt with encryption verification evidence"
+      ]
+    },
+    {
+      "id": 46,
+      "priority": 46,
+      "title": "[F-END-3] Git tag phase-f-complete and push",
+      "description": "Commit all Phase F files. Push. Tag phase-f-complete.",
+      "passes": false,
+      "test_requirements": [
+        "git tag phase-f-complete pushed to GitHub"
+      ]
+    },
+    {
+      "id": 47,
+      "priority": 47,
+      "title": "[G] Enable Nextcloud audit logging app",
+      "description": "Via SSM on fileshare1: occ app:enable admin_audit. Configure audit log destination: occ config:app:set admin_audit log_file --value=/var/log/nextcloud/audit.log. Create /var/log/nextcloud/ owned by www-data. Perform 5 test operations (login, upload, download, share, delete) as vpn-user. Verify audit.log contains all 5 event types with user=vpn-user, timestamp, and action fields.",
+      "passes": false,
+      "test_requirements": [
+        "admin_audit app enabled (occ app:list)",
+        "/var/log/nextcloud/audit.log exists and writable",
+        "After test operations: audit.log contains login event for vpn-user",
+        "After upload: audit.log contains file_create or write event",
+        "After share: audit.log contains share_created event",
+        "All events have timestamp and user fields"
+      ]
+    },
+    {
+      "id": 48,
+      "priority": 48,
+      "title": "[G] Configure Nextcloud brute-force protection and verify lockout",
+      "description": "Via SSM on fileshare1: verify brute-force protection enabled (occ config:system:get auth.bruteforce.protection.enabled). Simulate 10 rapid failed login attempts for a fake user via curl POST to /index.php/login. After 10 attempts, verify the IP is throttled (response time increases significantly or HTTP 429 returned). This satisfies NIST 800-171 3.1.8 (limit unsuccessful logon attempts).",
+      "passes": false,
+      "test_requirements": [
+        "auth.bruteforce.protection.enabled is true",
+        "After 10 failed login attempts, Nextcloud throttles requests (response time >1s or HTTP 429)",
+        "Throttle resets after waiting (occ security:bruteforce:reset 127.0.0.1)"
+      ]
+    },
+    {
+      "id": 49,
+      "priority": 49,
+      "title": "[G] Disable unnecessary Nextcloud apps and harden defaults",
+      "description": "Via SSM on fileshare1: disable apps not needed for a secure file share: occ app:disable activity (or configure to minimal logging); disable any social/federation apps that could leak data externally: occ app:disable federation, occ app:disable files_sharing_link (keep internal sharing only if required by policy). Enable: files_versions, files_trashbin. Set trash retention=30 days, versions retention=auto. Verify only necessary apps enabled.",
+      "passes": false,
+      "test_requirements": [
+        "occ app:list --enabled shows no federation or external sharing apps if disabled",
+        "files_versions app enabled",
+        "files_trashbin app enabled",
+        "occ config:app:get files_trashbin trashbin_retention_obligation shows retention configured"
+      ]
+    },
+    {
+      "id": 50,
+      "priority": 50,
+      "title": "[G] Configure fail2ban for Nextcloud failed logins",
+      "description": "Via SSM on fileshare1: apt-get install -y fail2ban. Create /etc/fail2ban/filter.d/nextcloud.conf with pattern matching Nextcloud failed login log entries. Create /etc/fail2ban/jail.d/nextcloud.conf: logpath=/var/log/nextcloud/audit.log, maxretry=5, bantime=3600, findtime=600. Start fail2ban. Trigger 6 failed logins and verify fail2ban bans the source IP. Unban after test.",
+      "passes": false,
+      "test_requirements": [
+        "fail2ban service active",
+        "Nextcloud jail exists in fail2ban (fail2ban-client status nextcloud)",
+        "After 6 failed logins from 127.0.0.1: fail2ban-client status nextcloud shows banned IP",
+        "fail2ban-client set nextcloud unbanip 127.0.0.1 works (cleanup)"
+      ]
+    },
+    {
+      "id": 51,
+      "priority": 51,
+      "title": "[G-END-1] Write Phase G test and replay scripts",
+      "description": "Write scripts/test-phase-g.sh: verify audit logging working (perform op and check log), brute-force protection enabled, fail2ban nextcloud jail active, unnecessary apps disabled, files_versions and files_trashbin enabled. Write scripts/replay-to-phase-g.sh for idempotent replay A through G.",
+      "passes": false,
+      "test_requirements": [
+        "test-phase-g.sh exits 0 with all checks PASS",
+        "replay-to-phase-g.sh completes successfully"
+      ]
+    },
+    {
+      "id": 52,
+      "priority": 52,
+      "title": "[G-END-2] EXECUTE PROOF: Destroy and replay to Phase G",
+      "description": "Run replay-to-phase-g.sh. Run test-phase-g.sh. All PASS. DEPLOYMENT-PROOF in progress.txt.",
+      "passes": false,
+      "test_requirements": [
+        "replay-to-phase-g.sh exits 0",
+        "test-phase-g.sh all PASS",
+        "DEPLOYMENT-PROOF in progress.txt"
+      ]
+    },
+    {
+      "id": 53,
+      "priority": 53,
+      "title": "[G-END-3] Git tag phase-g-complete and push",
+      "description": "Commit all Phase G files. Push. Tag phase-g-complete.",
+      "passes": false,
+      "test_requirements": [
+        "git tag phase-g-complete pushed to GitHub"
+      ]
+    },
+    {
+      "id": 54,
+      "priority": 54,
+      "title": "[H] Install CloudWatch Agent on fileshare1",
+      "description": "Via SSM on fileshare1: install CloudWatch Agent (apt-get install -y amazon-cloudwatch-agent or snap). Configure /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json to collect: /var/log/nextcloud/audit.log → /nist-fileshare/audit (JSON format), /var/log/nginx/access.log → /nist-fileshare/nginx-access, /var/log/nginx/error.log → /nist-fileshare/nginx-error, /var/log/syslog → /nist-fileshare/syslog. Start agent.",
+      "passes": false,
+      "test_requirements": [
+        "amazon-cloudwatch-agent service active",
+        "CloudWatch log group /nist-fileshare/audit exists in us-east-1",
+        "Perform a file operation and verify audit log entry appears in CloudWatch within 60s",
+        "Log groups /nist-fileshare/nginx-access and /nist-fileshare/nginx-error exist"
+      ]
+    },
+    {
+      "id": 55,
+      "priority": 55,
+      "title": "[H] Create CloudWatch metric filter for Nextcloud auth failures",
+      "description": "Create CloudWatch metric filter on /nist-fileshare/nginx-access log group matching 401 and 403 status codes. Metric: NistFileshareAuthFailures, namespace: NistFileshare. Also create metric filter on /nist-fileshare/audit for login_failed events. Create CloudWatch alarm: >10 auth failures in 5 minutes → SNS topic (look up nist-security-alerts by tag from parent project).",
+      "passes": false,
+      "test_requirements": [
+        "CloudWatch metric filter exists on /nist-fileshare/nginx-access",
+        "CloudWatch alarm NistFileshareAuthFailures-Alarm exists",
+        "Alarm SNS action configured (SNS topic ARN set)",
+        "Alarm in OK state initially"
+      ]
+    },
+    {
+      "id": 56,
+      "priority": 56,
+      "title": "[H] Create CloudWatch metric filter for large file uploads (data exfiltration indicator)",
+      "description": "Create CloudWatch metric filter on /nist-fileshare/audit log group matching upload events with file size > 100MB (pattern: 'file_create' with size indicator). Metric: NistFilesharelargeUploads. Create alarm: >5 large uploads in 1 hour → SNS topic. This satisfies NIST 800-171 3.1.3 (control CUI flows) by alerting on potential data exfiltration.",
+      "passes": false,
+      "test_requirements": [
+        "CloudWatch metric filter for large uploads exists on /nist-fileshare/audit",
+        "CloudWatch alarm NistFileshareLargeUploads-Alarm exists",
+        "Alarm in OK state initially"
+      ]
+    },
+    {
+      "id": 57,
+      "priority": 57,
+      "title": "[H] Verify end-to-end CloudWatch audit trail — trigger and confirm",
+      "description": "Via SSM on fileshare1: perform 15 rapid failed login attempts to trigger the auth-failure alarm. Wait 6 minutes. Confirm CloudWatch alarm NistFileshareAuthFailures-Alarm transitions to ALARM state. Verify failed login events appear in /nist-fileshare/audit log group. Reset by occ security:bruteforce:reset and waiting for alarm to return to OK.",
+      "passes": false,
+      "test_requirements": [
+        "15 failed logins generated",
+        "CloudWatch alarm transitions to ALARM state within 6 minutes",
+        "Failed login events visible in CloudWatch log group",
+        "Alarm returns to OK after failure events stop"
+      ]
+    },
+    {
+      "id": 58,
+      "priority": 58,
+      "title": "[H-END-1] Write Phase H test and replay scripts",
+      "description": "Write scripts/test-phase-h.sh: verify CWA running, log groups exist and have recent data, metric filters and alarms exist, perform a file op and confirm it appears in CloudWatch. Write scripts/replay-to-phase-h.sh for idempotent replay A through H.",
+      "passes": false,
+      "test_requirements": [
+        "test-phase-h.sh exits 0 with all checks PASS",
+        "replay-to-phase-h.sh completes successfully"
+      ]
+    },
+    {
+      "id": 59,
+      "priority": 59,
+      "title": "[H-END-2] EXECUTE PROOF: Destroy and replay to Phase H",
+      "description": "Run replay-to-phase-h.sh. Run test-phase-h.sh. All PASS. DEPLOYMENT-PROOF in progress.txt.",
+      "passes": false,
+      "test_requirements": [
+        "replay-to-phase-h.sh exits 0",
+        "test-phase-h.sh all PASS",
+        "DEPLOYMENT-PROOF in progress.txt"
+      ]
+    },
+    {
+      "id": 60,
+      "priority": 60,
+      "title": "[H-END-3] Git tag phase-h-complete and push",
+      "description": "Commit all Phase H files. Push. Tag phase-h-complete.",
+      "passes": false,
+      "test_requirements": [
+        "git tag phase-h-complete pushed to GitHub"
+      ]
+    },
+    {
+      "id": 61,
+      "priority": 61,
+      "title": "[I] Add fileshare1 to AWS Backup plan",
+      "description": "Look up existing AWS Backup plan from parent project (tag Project=nist-iac-builder). Create a new Backup selection including nist-fileshare1 by tag Project=nist-fileshare. Trigger on-demand backup. Verify backup job completes with status COMPLETED. Record recovery point ARN.",
+      "passes": false,
+      "test_requirements": [
+        "Backup selection for nist-fileshare1 exists in AWS Backup",
+        "On-demand backup of fileshare1 completes with COMPLETED status",
+        "Recovery point ARN recorded in progress.txt"
+      ]
+    },
+    {
+      "id": 62,
+      "priority": 62,
+      "title": "[I] Run NIST 800-171 compliance checklist for file share",
+      "description": "Via SSM script: verify each control: 3.1.1 (LDAP auth — only AD users), 3.1.2 (VPN-only access), 3.1.3 (CUI flow control — external shares require password+expiry, large-upload alarm), 3.1.8 (brute-force lockout — fail2ban+NC brute-force), 3.3.1 (audit log — CloudWatch), 3.3.2 (user attribution — all events have user+timestamp), 3.4.1 (config baseline — disabled apps, hardened PHP), 3.5.3 (MFA via VPN TOTP), 3.13.16 (CUI at rest — SSE enabled, disk grep test), 3.13.8 (CUI in transit — TLS enforced). Print PASS/FAIL for each.",
+      "passes": false,
+      "test_requirements": [
+        "All 10 NIST 800-171 controls verified PASS",
+        "Compliance results written to /tmp/fileshare-compliance.txt on fileshare1",
+        "No FAIL results"
+      ]
+    },
+    {
+      "id": 63,
+      "priority": 63,
+      "title": "[I] Write user-facing documentation: DESKTOP-SYNC-GUIDE.md",
+      "description": "Write DESKTOP-SYNC-GUIDE.md covering: (1) Windows — download Nextcloud desktop app, connect to https://fileshare1.nist.lab, import TLS CA cert to Windows trust store, authenticate with AD credentials; (2) Linux — install nextcloud-desktop-client, same config; (3) Mobile — iOS/Android Nextcloud app, import CA profile; (4) WebDAV mount instructions for Windows (Map Network Drive) and Linux (davfs2). Include the server URL, port, TLS cert import steps, and AD credential format. Commit to repo.",
+      "passes": false,
+      "test_requirements": [
+        "DESKTOP-SYNC-GUIDE.md exists in repo root",
+        "Document covers Windows, Linux, and mobile clients",
+        "TLS CA import instructions included",
+        "WebDAV mount instructions for Windows and Linux included",
+        "File committed and pushed to GitHub"
+      ]
+    },
+    {
+      "id": 64,
+      "priority": 64,
+      "title": "[I] Write COMPLIANCE-FILESHARE.md",
+      "description": "Write COMPLIANCE-FILESHARE.md: table mapping each NIST 800-171 control to the implementing mechanism in this file share deployment. Columns: Control ID | Control Name | Implementation | Test Evidence | Status. Cover all 10 controls from story #62 plus any additional relevant controls (3.1.19 CUI on mobile, 3.1.20 external connections). Include the actual test output snippets from story #62 as evidence.",
+      "passes": false,
+      "test_requirements": [
+        "COMPLIANCE-FILESHARE.md exists in repo root",
+        "Document covers at least 10 NIST 800-171 controls",
+        "Each control has implementation description and test evidence",
+        "File committed and pushed to GitHub"
+      ]
+    },
+    {
+      "id": 65,
+      "priority": 65,
+      "title": "[I] Full end-to-end test: VPN → file upload → share → audit verified",
+      "description": "Run a complete scenario via SSM scripts: (1) Generate fresh TOTP code and verify RADIUS ACCEPT (MFA confirmed), (2) vpn-user logs in to Nextcloud via WebDAV, (3) upload sensitive test file to personal folder, (4) upload file to NIST-Shared group folder, (5) create password-protected share link, (6) restore a previous version, (7) verify all operations appear in CloudWatch /nist-fileshare/audit within 60s. All 7 steps must PASS.",
+      "passes": false,
+      "test_requirements": [
+        "Step 1: TOTP/RADIUS auth verified ACCEPT",
+        "Step 2: WebDAV auth succeeds with vpn-user credentials",
+        "Step 3: File upload to personal folder returns 201",
+        "Step 4: File upload to NIST-Shared returns 201",
+        "Step 5: Share link created with password, download via link succeeds",
+        "Step 6: Version restore succeeds and content matches",
+        "Step 7: All 6 operations visible in CloudWatch audit log"
+      ]
+    },
+    {
+      "id": 66,
+      "priority": 66,
+      "title": "[I-END-1] Write Phase I test and replay scripts",
+      "description": "Write scripts/test-phase-i.sh: run compliance check (all PASS), verify backup configured, run E2E scenario (all 7 steps), verify documentation files exist. Write scripts/replay-to-phase-i.sh for full project replay A through I.",
+      "passes": false,
+      "test_requirements": [
+        "test-phase-i.sh exits 0 with all checks PASS",
+        "replay-to-phase-i.sh completes all phases successfully"
+      ]
+    },
+    {
+      "id": 67,
+      "priority": 67,
+      "title": "[I-END-2] EXECUTE PROOF: Full replay of all phases",
+      "description": "Run replay-to-phase-i.sh (full rebuild from scratch). Run test-phase-i.sh. All PASS. Record final DEPLOYMENT-PROOF in progress.txt with all resource IDs, compliance results, and E2E test evidence.",
+      "passes": false,
+      "test_requirements": [
+        "replay-to-phase-i.sh exits 0 (full project rebuild)",
+        "test-phase-i.sh all PASS",
+        "Final DEPLOYMENT-PROOF with real IDs in progress.txt",
+        "E2E all 7 steps PASS"
+      ]
+    },
+    {
+      "id": 68,
+      "priority": 68,
+      "title": "[I-END-3] Final git tag project-complete and push",
+      "description": "Commit all final changes. Push. Tag project-complete. Verify all 68 stories have passes: true.",
+      "passes": false,
+      "test_requirements": [
+        "git tag project-complete pushed to GitHub",
+        "All 68 stories passes: true in prd.json",
+        "Final push to GitHub confirmed"
+      ]
+    }
+  ]
+}
